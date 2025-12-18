@@ -1,9 +1,10 @@
 import argparse
 import os
 import json
+import time
 from dotenv import load_dotenv
 from datetime import datetime
-from openai import AzureOpenAI
+from openai import AzureOpenAI, RateLimitError
 from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.indexes import SearchIndexClient
@@ -12,6 +13,8 @@ from azure.search.documents.models import VectorizedQuery
 # ------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------
+
+load_dotenv()
 
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
@@ -129,9 +132,9 @@ Available Evidence Statements:
 Here are example items for style only (do NOT copy or paraphrase):
 {examples_block}
 
-Below are three full examples showing correct use of 1, 2, and 3 evidence statements and overall structure. Treat these examples as the gold standard for the level of detail, alignment, and clarity expected.
+Below is one example showing the correct structure and alignment between the scenario, question, options, rationale, and evidence statements.
 
-Example with 1 evidence statement:
+Example:
 {{
     "evidence_statements": [
         "01.02.01 - Apply the legal test for consideration, including both elements of legal value and bargained-for-exchange."
@@ -148,44 +151,6 @@ Example with 1 evidence statement:
     "rationale": "Taylor's promise to fix the car represents a legal detriment, fulfilling the element of legal value in a bargained-for exchange."
 }}
 
-Example with 2 evidence statements:
-{{
-    "evidence_statements": [
-        "01.02.01 - Apply the legal test for consideration, including both elements of legal value and bargained-for-exchange.",
-        "01.02.03 - Identify the legal detriment to the promisee and/or legal benefit to the promisor in a given fact pattern."
-    ],
-    "scenario": "Alex promises to deliver a rare book to Jamie if Jamie agrees to paint Alex's fence. Jamie paints the fence, but Alex refuses to deliver the book. Both parties understood the terms and agreed in writing.",
-    "question": "Which elements of consideration are present in this agreement?",
-    "options": {{
-        "A": "Jamie's act of painting the fence is a legal detriment, and Alex's promise to deliver the book is a legal benefit.",
-        "B": "Only Jamie's act is relevant to consideration.",
-        "C": "Only Alex's promise is relevant to consideration.",
-        "D": "There is no consideration present."
-    }},
-    "correct_option": "A",
-    "rationale": "Jamie's act is a legal detriment and Alex's promise is a legal benefit, satisfying the legal test for consideration."
-}}
-
-Example with 3 evidence statements:
-{{
-    "evidence_statements": [
-        "01.02.01 - Apply the legal test for consideration, including both elements of legal value and bargained-for-exchange.",
-        "01.02.03 - Identify the legal detriment to the promisee and/or legal benefit to the promisor in a given fact pattern.",
-        "01.02.05 - Understand the concept of adequacy of consideration and the principle of 'freedom of contract.'"
-    ],
-    "scenario": "Jordan agrees to sell a painting to Casey for $10, even though the painting is worth $1,000. Casey promises to deliver a set of rare books to Jordan as part of the deal. Both parties sign a contract.",
-    "question": "Which legal principles are illustrated by this agreement?",
-    "options": {{
-        "A": "The adequacy of consideration is not relevant, and both parties have provided legal value.",
-        "B": "The contract is void due to inadequate consideration.",
-        "C": "Only Casey's promise is relevant to consideration.",
-        "D": "There is no legal detriment present."
-    }},
-    "correct_option": "A",
-    "rationale": "Both parties have provided legal value and detriment, and the court will not inquire into the adequacy of consideration, respecting the freedom of contract."
-}}
-
-
 Out-of-scope behavior:
 - If the topic is clearly outside the scope of these Evidence Statements, respond with:
 
@@ -195,11 +160,11 @@ OUT_OF_SCOPE
 - Do NOT return OUT_OF_SCOPE just because it is difficult to create scenarios or because some scenarios feel similar.
 
 Item count behavior:
-- If you cannot generate {num_items} unique items that meet all requirements, generate as many valid, unique items as you can (even if fewer than {num_items}).
-- Always maximize the number of valid, unique items in your response.
+- Your goal is to generate EXACTLY {num_items} items that meet all requirements.
+- Only generate fewer than {num_items} if you reach a hard limit (for example, the response becomes too long to continue). In that case, still maximize the number of valid, unique items in your response.
 
 Generation task:
-- Otherwise, generate up to {num_items} NEW exam items in the following machine-readable format.
+- Otherwise, generate EXACTLY {num_items} NEW exam items in the following machine-readable format.
 
 Format:
 - Output a JSON array.
@@ -209,28 +174,50 @@ Format:
     - "question": string, one clear question about the scenario.
     - "options": object with keys "A", "B", "C", "D", each a plausible answer and mutually exclusive.
     - "correct_option": one of "A", "B", "C", "D".
-    - "rationale": string that explains why the correct option is correct by reference to the Evidence Statement(s), and briefly why the other options are not correct.
+    - "rationale": 1–2 sentences that explain why the correct option is correct by reference to the Evidence Statement(s).
 
 Requirements:
 - Use only Evidence Statements from the provided list; do not invent new ones or modify their wording.
-- Randomly select 1, 2, or 3 Evidence Statements per item. At least 30% of items must use 2 or 3 Evidence Statements combined.
-- Ensure all items are unique in surface wording. It is acceptable if some scenarios or legal issues are similar, as long as the wording and context differ.
-- If you cannot generate enough unique legal scenarios, create additional items by varying the names of parties, businesses, and factual details, while keeping the legal issue and evidence alignment. Do not repeat the exact same scenario text.
-- Ensure the scenario clearly implicates each listed Evidence Statement; avoid tagging evidence that is only tangentially related.
+
+Evidence selection requirements:
+- For each item, select 1, 2, or 3 Evidence Statements from the provided list.
+- You MUST use a mix of 1, 2, and 3 Evidence Statements across all items.
+- At least 30% of items MUST use 2 or 3 Evidence Statements.
+- You MUST NOT make all items use only 1 Evidence Statement.
+- Before finalizing your answer, count how many items use 1, 2, and 3 Evidence Statements.
+  - If fewer than 30% of items use 2 or 3 Evidence Statements, revise the items so that at least 30% do.
+
+- Ensure all items are unique in surface wording. You may reuse similar legal issues as long as the wording and specific facts differ.
+- If you run out of genuinely distinct legal scenarios, you may vary names of parties, businesses, and factual details, while keeping the legal issue and evidence alignment. Do not repeat the exact same scenario text.
+- Ensure each scenario clearly implicates every listed Evidence Statement; avoid tagging evidence that is only tangentially related.
 - Do not reuse or closely paraphrase any example content.
 - Ensure legal accuracy and clear alignment with the chosen Evidence Statements.
 - Avoid trick questions; the correct option must be unambiguously correct under the Evidence Statements.
 - Avoid real person or organization names; use generic or fictional names only.
-- Do not provide real-world legal advice or procedural guidance; focus only on the exam-style analysis implied by the Evidence Statements.
+- Do not provide real-world legal advice or procedural guidance; focus only on exam-style analysis implied by the Evidence Statements.
 - Return ONLY valid JSON or the OUT_OF_SCOPE format described above.
 - Output only raw JSON (no surrounding commentary, no code fences, no triple backticks).
 '''.strip()
 
         return prompt
 
-def generate_exam_items(evidence_statements: str,
-                        topic_query: str,
-                        num_items: int = 20) -> str:
+
+def call_with_backoff(func, *args, **kwargs):
+    max_retries = 6
+    delay = 2
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except RateLimitError as e:
+            if attempt == max_retries - 1:
+                raise
+            sleep_time = delay * (2 ** attempt)
+            print(f"Rate limit hit. Retrying in {sleep_time} seconds...")
+            time.sleep(sleep_time)
+
+def generate_exam_items_stream(evidence_statements: str,
+                               topic_query: str,
+                               num_items: int = 20):
     # 1. Retrieve example items for style
     examples = retrieve_examples(topic_query, k=5)
 
@@ -242,8 +229,9 @@ def generate_exam_items(evidence_statements: str,
         num_items=num_items
     )
 
-    # 3. Call the chat model with a system + user message
-    response = client.chat.completions.create(
+    # 3. Call the chat model with a system + user message, with exponential backoff
+    response = call_with_backoff(
+        client.chat.completions.create,
         model=AZURE_OPENAI_CHAT_MODEL,
         messages=[
             {
@@ -275,9 +263,21 @@ Guardrails:
 
     content = response.choices[0].message.content
 
-    # Optional: you can parse/validate JSON or detect OUT_OF_SCOPE here.
-    # For now, just return the raw content.
-    return content
+    # If OUT_OF_SCOPE, yield as a single line
+    if content.strip().startswith("OUT_OF_SCOPE"):
+        yield {"OUT_OF_SCOPE": content.strip()}
+        return
+
+    # Try to parse as JSON array
+    try:
+        items = json.loads(content)
+        if isinstance(items, list):
+            for item in items:
+                yield item
+        else:
+            yield {"error": "Expected a list of items", "raw": content}
+    except Exception as e:
+        yield {"error": f"Failed to parse JSON: {e}", "raw": content}
 
 # ------------------------------------------------------------
 # CLI / MAIN
@@ -310,26 +310,20 @@ if __name__ == "__main__":
 
     evidence_text = get_evidence_text(args.evidence_prefix)
 
-    output = generate_exam_items(
-        evidence_statements=evidence_text,
-        topic_query=args.topic,
-        num_items=args.num_items
-    )
-
     # Prepare output directory and filename
     os.makedirs("output", exist_ok=True)
-    # Clean evidence prefix for filename (replace spaces with underscores, remove special chars)
     safe_prefix = "_".join(args.evidence_prefix.lower().split())
     safe_prefix = "".join(c for c in safe_prefix if c.isalnum() or c == "_")
     timespan = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"output/{safe_prefix}_{args.num_items}_{timespan}.json"
+    filename = f"output/{safe_prefix}_{args.num_items}_{timespan}.jsonl"
 
-    try:
-        parsed = json.loads(output)
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(parsed, f, ensure_ascii=False, indent=2)
-        print(f"✅ Output saved to {filename}")
-    except Exception:
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(output)
-        print(f"⚠️ Output not valid JSON, saved as text to {filename}")
+    count = 0
+    with open(filename, "w", encoding="utf-8") as f:
+        for item in generate_exam_items_stream(
+            evidence_statements=evidence_text,
+            topic_query=args.topic,
+            num_items=args.num_items
+        ):
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            count += 1
+    print(f"✅ {count} items saved to {filename} (JSONL)")
