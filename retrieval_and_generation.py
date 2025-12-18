@@ -214,29 +214,43 @@ def call_with_backoff(func, *args, **kwargs):
             sleep_time = delay * (2 ** attempt)
             print(f"Rate limit hit. Retrying in {sleep_time} seconds...")
             time.sleep(sleep_time)
+        except Exception as e:
+            # Also backoff for transient errors
+            if attempt == max_retries - 1:
+                raise
+            sleep_time = delay * (2 ** attempt)
+            print(f"Error: {e}. Retrying in {sleep_time} seconds...")
+            time.sleep(sleep_time)
 
-def generate_exam_items_stream(evidence_statements: str,
+def generate_exam_items_batches(evidence_statements: str,
                                topic_query: str,
-                               num_items: int = 20):
-    # 1. Retrieve example items for style
+                               num_items: int = 20,
+                               batch_size: int = 5,
+                               max_batch_tokens: int = 48000):
+    # Retrieve example items for style (once)
     examples = retrieve_examples(topic_query, k=5)
 
-    # 2. Build the user-facing task prompt
-    user_prompt = build_user_prompt(
-        evidence_statements=evidence_statements,
-        examples=examples,
-        topic_query=topic_query,
-        num_items=num_items
-    )
+    total_generated = 0
+    batch_num = 0
+    while total_generated < num_items:
+        batch_num += 1
+        # Adjust batch size if close to the end
+        current_batch_size = min(batch_size, num_items - total_generated)
+        user_prompt = build_user_prompt(
+            evidence_statements=evidence_statements,
+            examples=examples,
+            topic_query=topic_query,
+            num_items=current_batch_size
+        )
 
-    # 3. Call the chat model with a system + user message, with exponential backoff
-    response = call_with_backoff(
-        client.chat.completions.create,
-        model=AZURE_OPENAI_CHAT_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": """
+        # Exponential backoff for each batch
+        response = call_with_backoff(
+            client.chat.completions.create,
+            model=AZURE_OPENAI_CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
 You are an expert assessment item writer specializing in generating legally accurate,
 scenario-based multiple-choice items for professional exams in contract law.
 
@@ -252,32 +266,44 @@ Guardrails:
 - Do not include real person names, real organizations, or real case citations; use generic names and entities only.
 - Avoid discriminatory, defamatory, or clearly inappropriate scenarios.
 """.strip(),
-            },
-            {
-                "role": "user",
-                "content": user_prompt,
-            },
-        ],
-        temperature=0.7,
-    )
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+            temperature=0.7,
+        )
 
-    content = response.choices[0].message.content
+        content = response.choices[0].message.content
+        # Token usage monitoring
+        usage = getattr(response, 'usage', None)
+        total_tokens = usage.total_tokens if usage and hasattr(usage, 'total_tokens') else None
+        print(f"Batch {batch_num}: generated {current_batch_size} items. Tokens used: {total_tokens}")
 
-    # If OUT_OF_SCOPE, yield as a single line
-    if content.strip().startswith("OUT_OF_SCOPE"):
-        yield {"OUT_OF_SCOPE": content.strip()}
-        return
+        # If OUT_OF_SCOPE, yield as a single line
+        if content.strip().startswith("OUT_OF_SCOPE"):
+            yield {"OUT_OF_SCOPE": content.strip()}
+            return
 
-    # Try to parse as JSON array
-    try:
-        items = json.loads(content)
-        if isinstance(items, list):
-            for item in items:
-                yield item
-        else:
-            yield {"error": "Expected a list of items", "raw": content}
-    except Exception as e:
-        yield {"error": f"Failed to parse JSON: {e}", "raw": content}
+        # Try to parse as JSON array
+        try:
+            items = json.loads(content)
+            if isinstance(items, list):
+                for item in items:
+                    yield item
+                total_generated += len(items)
+            else:
+                yield {"error": "Expected a list of items", "raw": content}
+                total_generated += 1
+        except Exception as e:
+            yield {"error": f"Failed to parse JSON: {e}", "raw": content}
+            total_generated += 1
+
+        # If token usage is close to the limit, start a new batch
+        if total_tokens and total_tokens >= max_batch_tokens:
+            print(f"Token usage {total_tokens} close to limit, starting new batch.")
+            continue
 
 # ------------------------------------------------------------
 # CLI / MAIN
@@ -303,6 +329,18 @@ def parse_args():
         default=20,
         help="Number of exam items to generate (default: 20)."
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=5,
+        help="Number of items to generate per batch (default: 5)."
+    )
+    parser.add_argument(
+        "--max-batch-tokens",
+        type=int,
+        default=48000,
+        help="Maximum tokens per batch before starting a new batch (default: 48000, just under 50K)."
+    )
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -314,16 +352,63 @@ if __name__ == "__main__":
     os.makedirs("output", exist_ok=True)
     safe_prefix = "_".join(args.evidence_prefix.lower().split())
     safe_prefix = "".join(c for c in safe_prefix if c.isalnum() or c == "_")
-    timespan = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"output/{safe_prefix}_{args.num_items}_{timespan}.jsonl"
+    filename = f"output/{args.evidence_prefix}_{args.num_items}.jsonl"
 
-    count = 0
-    with open(filename, "w", encoding="utf-8") as f:
-        for item in generate_exam_items_stream(
+    # Resume support: check for existing items
+    existing_items = []
+    existing_hashes = set()
+    max_id = 0
+    if os.path.exists(filename):
+        with open(filename, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                    # Use scenario+question as a unique hash for deduplication
+                    if isinstance(item, dict) and "scenario" in item and "question" in item:
+                        h = hash(item["scenario"] + item["question"])
+                        existing_hashes.add(h)
+                        existing_items.append(item)
+                        # Track max id if present
+                        if "id" in item:
+                            try:
+                                max_id = max(max_id, int(item["id"]))
+                            except Exception:
+                                pass
+                except Exception:
+                    continue
+
+    count = len(existing_items)
+    print(f"Resuming from {count} items in {filename} (if exists). Target: {args.num_items}")
+
+    # Ensure file ends with a newline before appending
+    if os.path.exists(filename):
+        with open(filename, "rb+") as f_check:
+            f_check.seek(0, os.SEEK_END)
+            if f_check.tell() > 0:
+                f_check.seek(-1, os.SEEK_END)
+                last_char = f_check.read(1)
+                if last_char != b"\n":
+                    f_check.write(b"\n")
+
+    with open(filename, "a", encoding="utf-8") as f:
+        for item in generate_exam_items_batches(
             evidence_statements=evidence_text,
             topic_query=args.topic,
-            num_items=args.num_items
+            num_items=args.num_items,
+            batch_size=args.batch_size,
+            max_batch_tokens=args.max_batch_tokens
         ):
+            # Deduplicate by scenario+question hash
+            if isinstance(item, dict) and "scenario" in item and "question" in item:
+                h = hash(item["scenario"] + item["question"])
+                if h in existing_hashes:
+                    continue
+                existing_hashes.add(h)
+                # Add a unique id for traceability
+                item["id"] = max_id + 1
+                max_id += 1
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
             count += 1
+            if count >= args.num_items:
+                break
     print(f"✅ {count} items saved to {filename} (JSONL)")
