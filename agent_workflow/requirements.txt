@@ -1,0 +1,13 @@
+# Microsoft Agent Framework (Preview)
+agent-framework-azure-ai
+
+# Azure SDKs
+azure-identity
+azure-search-documents
+
+# OpenAI
+openai
+
+# Utilities
+python-dotenv
+numpy

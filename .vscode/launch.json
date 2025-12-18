@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Generate Items TP.2",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/generate_items.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--topic", "TP.2",
+                "--count", "5",
+                "--output", "./output/tp.2_5.jsonl"
+            ]
+        }
+    ]
+}
