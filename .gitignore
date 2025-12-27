@@ -8,6 +8,7 @@ __pycache__/
 
 # Output folder
 output/
+rubrics/
 
 # Distribution / packaging
 .Python
