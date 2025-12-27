@@ -23,8 +23,6 @@ Construct Validity, Reliability and Fair
 - Fair DOES NOT mean everyone performs equally well! On the contrary, we want the test to “discriminate” statistically between less and more able test takers!
 
 How do we make JD-Next valid, reliable, and fair?
--------------------------------------------------
-Write items (test questions) that:
 - Align to topics/evidence statements
 - Follow item-writing best practices
 - Are varied and interesting, but do not introduce unnecessary construct-irrelevant variance
